@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -9,75 +10,175 @@ interface IPriceOracle {
 }
 
 contract UpsideLending {
-    IPriceOracle upsideOracle;
-    IERC20 public reserveToken;
+    IPriceOracle public upsideOracle;
+    IERC20 public usdc;
 
-    //사용자 담보자산
-    mapping(address => uint256) public collateralBalance;
-    //사용자 대출잔액
-    mapping(address => uint256) public borrowBalance;
+    uint256 public constant LTV_RATIO = 50; // LTV ratio at 50%
+    uint256 public constant LIQUIDATION_THRESHOLD = 75; // Liquidation threshold at 75%
+    uint256 public constant INTEREST_RATE_PER_BLOCK =  0.001 * 1e15;  // 계산방법을 모르겠다... 대충 넣으니 되는데 왜 되는지 모르겠다.
 
-    constructor(IPriceOracle _upsideOracle, address _reserveToken) {
-        upsideOracle = _upsideOracle;
-        reserveToken = IERC20(_reserveToken);
-    }
-
-    function initializeLendingProtocol(address _reserveToken) external payable {
-        reserveToken = IERC20(_reserveToken);
-        IERC20(_reserveToken).transferFrom(msg.sender, address(this), msg.value);
-    }
-
-    //담보금액을 입금
-    function deposit(address token, uint256 amount) external payable {
-        if (token == address(0x0)) {    // Ether deposit
-            require(msg.value == amount, "Incorrect Ether amount sent");
-            uint256 etherPrice = upsideOracle.getPrice(token);
-            uint256 reserveTokenAmount = (amount * etherPrice);
-
-            collateralBalance[msg.sender] += reserveTokenAmount;
-
-        } else {    // ERC20 deposit
-            uint256 tokenPrice = upsideOracle.getPrice(token);
-            uint256 reserveTokenAmount = (amount * tokenPrice) / 1e18;
-
-            require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
-
-            collateralBalance[msg.sender] += reserveTokenAmount;
-        }
-    }
+    mapping(address => uint256) public totalDepositToken; // Total deposit for each token
     
+    struct Account {
+        uint256 ETHDepositAmount;
+        uint256 USDCDepositAmount;
+        uint256 ETHBorrowedAmount;
+        uint256 USDCBorrowedAmount;
+        uint256 lastBlockUpdate;
+    }
+
+    mapping(address => Account) public accounts;
+
+    constructor(IPriceOracle _upsideOracle, address _usdc) {
+        upsideOracle = _upsideOracle;
+        usdc = IERC20(_usdc);
+    }
+
+    function initializeLendingProtocol(address _usdc) external payable {
+        require(msg.value > 0, "Must send initial reserve");
+        IERC20(_usdc).transferFrom(msg.sender, address(this), msg.value);
+    }
+
+    function deposit(address token, uint256 amount) external payable {
+        _updateDebt(msg.sender);
+        require(amount > 0, "Amount must be greater than 0");
+
+        if (token == address(0)) { // ETH deposit
+            require(msg.value >= amount, "Incorrect Ether amount sent");
+            accounts[msg.sender].ETHDepositAmount += amount;
+        } else { // USDC deposit
+            require(IERC20(token) == usdc, "Invalid token");
+            accounts[msg.sender].USDCDepositAmount += amount;
+            IERC20(usdc).transferFrom(msg.sender, address(this), amount);
+        }
+
+        totalDepositToken[token] += amount;
+    }
+
     function borrow(address token, uint256 amount) external {
-        uint256 price = upsideOracle.getPrice(token);
-        uint256 reserveTokenAmount = (amount * price) / 1e18;
-        
-        // 예를 들어, 담보 비율이 150%라면 필요한 담보 금액은 대출 금액의 1.5배
-        uint256 requiredCollateral = reserveTokenAmount * 150 / 100;
+        require(amount > 0, "Amount must be greater than 0");
+        _updateDebt(msg.sender);
 
-        // 충분한 담보가 있는지 확인
-        uint256 collateralValue = collateralBalance[msg.sender];
-        require(collateralValue >= requiredCollateral, "Insufficient collateral");
+        require(totalDepositToken[token] >= amount, "Insufficient liquidity");
 
-        // 프로토콜에 충분한 자금이 있는지 확인
-        uint256 availableLiquidity = reserveToken.balanceOf(address(this));
-        require(availableLiquidity >= reserveTokenAmount, "Insufficient liquidity in the pool");
+        uint256 userDepositValue = _calculateDepositValue(msg.sender);
+        uint256 userBorrowValue = _calculateBorrowValue(msg.sender);
+        uint256 borrowValue = upsideOracle.getPrice(token) * amount;
 
-        // borrowBalance에 sender의 대출금액 추가
-        borrowBalance[msg.sender] += reserveTokenAmount;
+        require(
+            userDepositValue >= (borrowValue + userBorrowValue) * 100 / LTV_RATIO,
+            "Insufficient collateral to borrow"
+        );
 
-        // 대출 금액을 사용자에게 전송
-        require(reserveToken.transfer(msg.sender, reserveTokenAmount), "Transfer failed");
+        if (token == address(0)) {
+            accounts[msg.sender].ETHBorrowedAmount += amount;
+            payable(msg.sender).transfer(amount);
+        } else {
+            require(IERC20(token) == usdc, "Invalid token");
+            accounts[msg.sender].USDCBorrowedAmount += amount;
+            IERC20(usdc).transfer(msg.sender, amount);
+        }
+
+        totalDepositToken[token] -= amount;
     }
 
     function repay(address token, uint256 amount) external {
+        _updateDebt(msg.sender);
+        require(amount > 0, "Amount must be greater than 0");
+
+        if (token == address(0)) {
+            require(accounts[msg.sender].ETHBorrowedAmount >= amount, "Repay amount exceeds borrowed");
+            accounts[msg.sender].ETHBorrowedAmount -= amount;
+        } else {
+            require(IERC20(token) == usdc, "Invalid token");
+            require(accounts[msg.sender].USDCBorrowedAmount >= amount, "Repay amount exceeds borrowed");
+            accounts[msg.sender].USDCBorrowedAmount -= amount;
+            IERC20(usdc).transferFrom(msg.sender, address(this), amount);
+        }
+
+        totalDepositToken[token] += amount;
     }
 
     function withdraw(address token, uint256 amount) external {
-    }
+        require(amount > 0, "Amount must be greater than 0");
+        _updateDebt(msg.sender);
 
-    function getAccruedSupplyAmount(address token) external view returns (uint256) {
+        uint256 userDepositValue = _calculateDepositValue(msg.sender);
+        uint256 userBorrowValue = _calculateBorrowValue(msg.sender);
+        uint256 withdrawValue = upsideOracle.getPrice(token) * amount;
+
+        require(
+            (userDepositValue - withdrawValue) * LIQUIDATION_THRESHOLD / 100 >= userBorrowValue,
+            "Insufficient collateral to withdraw"
+        );
+
+        if (token == address(0)) {
+            require(accounts[msg.sender].ETHDepositAmount >= amount, "Insufficient ETH deposit");
+            accounts[msg.sender].ETHDepositAmount -= amount;
+            payable(msg.sender).transfer(amount);
+        } else {
+            require(IERC20(token) == usdc, "Invalid token");
+            require(accounts[msg.sender].USDCDepositAmount >= amount, "Insufficient USDC deposit");
+            accounts[msg.sender].USDCDepositAmount -= amount;
+            IERC20(usdc).transfer(msg.sender, amount);
+        }
+
+        totalDepositToken[token] -= amount;
     }
 
     function liquidate(address borrower, address token, uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+        _updateDebt(borrower);
+
+        uint256 userBorrowValue = _calculateBorrowValue(borrower);
+        uint256 userDepositValue = _calculateDepositValue(borrower);
+
+        require(
+            userBorrowValue * 100 / userDepositValue >= LIQUIDATION_THRESHOLD,
+            "Loan is healthy"
+        );
+
+        uint256 maxLiquidation = accounts[borrower].USDCBorrowedAmount / 4;
+        require(amount <= maxLiquidation, "Exceeds max liquidation amount");
+
+        uint256 collateralToSize = (amount * upsideOracle.getPrice(address(usdc))) / upsideOracle.getPrice(address(0));
+
+        require(accounts[borrower].ETHDepositAmount >= collateralToSize, "Insufficient collateral to liquidate");
+
+
+        accounts[borrower].USDCBorrowedAmount -= amount;
+        accounts[borrower].ETHDepositAmount -= collateralToSize;
+
+        IERC20(usdc).transferFrom(msg.sender, address(this), amount);
+        payable(msg.sender).transfer(collateralToSize);
     }
 
+    function _updateDebt(address user) private {
+        uint256 blockGap = block.number - accounts[user].lastBlockUpdate;
+
+        while(blockGap > 0) {
+            accounts[user].ETHBorrowedAmount += (accounts[user].ETHBorrowedAmount * INTEREST_RATE_PER_BLOCK * blockGap) / 1e18;
+            accounts[user].USDCBorrowedAmount += (accounts[user].USDCBorrowedAmount * INTEREST_RATE_PER_BLOCK * blockGap) / 1e18;
+            blockGap--;
+        }
+        accounts[user].lastBlockUpdate = block.number;
+    }
+
+    function _calculateBorrowValue(address user) private view returns (uint256) {
+        uint256 etherBorrowedValue = accounts[user].ETHBorrowedAmount * upsideOracle.getPrice(address(0)); // ETH
+        uint256 usdcBorrowedValue = accounts[user].USDCBorrowedAmount * upsideOracle.getPrice(address(usdc)); // USDC
+        return etherBorrowedValue + usdcBorrowedValue;
+    }
+
+    function _calculateDepositValue(address user) private view returns (uint256) {
+        uint256 etherDepositValue = accounts[user].ETHDepositAmount * upsideOracle.getPrice(address(0)); // ETH
+        uint256 usdcDepositValue = accounts[user].USDCDepositAmount * upsideOracle.getPrice(address(usdc)); // USDC
+        return etherDepositValue + usdcDepositValue;
+    }
+
+    function getAccruedSupplyAmount(address user) external view returns (uint256) {
+        // TODO: Implement this function
+    }
+
+    receive() external payable {}
 }
